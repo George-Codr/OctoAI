@@ -11,13 +11,11 @@ logger = logging.getLogger("superbrain.client")
 LIMITERS = {
     "deepseek": AsyncLimiter(20, 1),
     "gemini": AsyncLimiter(10, 1),
-    "groq": AsyncLimiter(15, 1),
     "openrouter": AsyncLimiter(15, 1),
 }
 
 BASES = {
     "deepseek": "https://api.deepseek.com/v1",
-    "groq": "https://api.groq.com/openai/v1",
     "openrouter": "https://api.openrouter.ai/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
 }
@@ -79,11 +77,6 @@ class UnifiedClient:
             payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
             return await self._post("deepseek", endpoint, payload, headers)
 
-        if provider == "groq":
-            endpoint = "/chat/completions"
-            headers = {"Authorization": f"Bearer {KEYS['groq']}", "Content-Type": "application/json"}
-            payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
-            return await self._post("groq", endpoint, payload, headers)
 
         if provider == "openrouter":
             endpoint = "/chat/completions"
