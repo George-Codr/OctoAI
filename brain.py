@@ -1,5 +1,5 @@
 # brain.py
-import asyncio, json, logging, math, random
+import asyncio, json, logging, math, random, time
 from client import UnifiedClient
 from memory import PersistentMemory
 from config import MODELS, PROVIDER_PRIORS, DATA_DIR
@@ -7,7 +7,9 @@ from typing import Dict, Any
 
 logger = logging.getLogger("superbrain.brain")
 
-# Simple online bandit (Exp3) to adapt provider selection per region
+# --------------------------
+# Adaptive provider selector (Exp3 bandit)
+# --------------------------
 class Exp3Selector:
     def __init__(self, choices, gamma=0.2):
         self.choices = choices  # list of keys (e.g., "deepseek")
@@ -26,11 +28,14 @@ class Exp3Selector:
         x = reward / prob
         self.weights[choice] *= math.exp((self.gamma * x) / len(self.choices))
 
+# --------------------------
+# SuperBrain core
+# --------------------------
 class SuperBrain:
     def __init__(self):
         self.client = UnifiedClient()
         self.mem = PersistentMemory()
-        # selectors per region to adapt which provider to prefer; initialize with providers seen in MODELS
+        # selectors per region to adapt which provider to prefer
         region_providers = {}
         for region, models in MODELS.items():
             provs = list({p for (p,m) in models})
@@ -38,8 +43,8 @@ class SuperBrain:
                 region_providers[region] = Exp3Selector(provs)
         self.selectors = region_providers
 
+    # classify query into regions
     async def classify_regions(self, query: str):
-        # fast keyword + fallback classifier via sensory model
         q = query.lower()
         regions = set()
         if any(w in q for w in ["code","python","implement","debug"]): regions.add("coding")
@@ -48,7 +53,7 @@ class SuperBrain:
         if any(w in q for w in ["story","poem","write","creative","imagine"]): regions.add("creativity")
         if regions:
             return list(regions)
-        # AI classify
+        # AI classify fallback
         messages = [{"role":"system","content":"Return one or more of: reasoning, search, coding, creativity (comma-separated)."},
                     {"role":"user","content":query}]
         try:
@@ -61,6 +66,7 @@ class SuperBrain:
             logger.warning("Sensory failure: %s", e)
             return ["reasoning","search"]
 
+    # helper to extract text from provider response
     def _extract(self, response: Dict[str,Any]) -> str:
         try:
             if "choices" in response:
@@ -71,48 +77,62 @@ class SuperBrain:
         except Exception:
             return str(response)
 
+    # run experts in parallel
     async def run_region_experts(self, regions, query):
-        # use selectors to sample provider choices for each region
         tasks = []
         task_map = []
-        messages = [{"role":"system","content":"You are an expert for this region."},{"role":"user","content":query}]
+        messages = [{"role":"system","content":"You are an expert for this region."},
+                    {"role":"user","content":query}]
         for region in regions:
-            # sample one provider (policy) and one fallback model from MODELS list
+            # Web Search region handled specially (top 15 results)
+            if region == "search":
+                async def web_search():
+                    prov, model = MODELS["search"][0]
+                    prompt = [
+                        {"role":"system","content":"You are a web search assistant. Return top 15 relevant results with title, snippet, and URL in structured JSON format."},
+                        {"role":"user","content":query}
+                    ]
+                    resp = await self.client.chat(prov, model, prompt, max_tokens=1500)
+                    text = self._extract(resp)
+                    return ("search_ai", model, "search", text)
+                tasks.append(asyncio.create_task(web_search()))
+                task_map.append(("search", "search_ai", "web_model"))
+                continue
+
+            # Previous logic for other regions
             selector = self.selectors.get(region)
             if selector:
                 chosen, probs = selector.sample(k=1)
                 provider = chosen[0]
             else:
                 provider = MODELS.get(region, [("groq","llama-3.1-8b-instant")])[0][0]
-            # choose first model for that provider (fallback if not found)
+
+            # pick first model for that provider
             model = None
             for p,m in MODELS.get(region, []):
                 if p==provider:
                     model = m
                     break
             if model is None:
-                # fallback
                 p,m = MODELS.get(region,[("groq","llama-3.1-8b-instant")])[0]
-                provider, model = p, m
+                provider, model = p,m
+
             async def call(p=provider, m=model, reg=region):
                 res = await self.client.chat(p, m, messages, max_tokens=600)
                 return (p,m,reg,res)
+
             tasks.append(asyncio.create_task(call()))
             task_map.append((region, provider, model))
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
         responses = {}
-        # for feedback: record (provider, prob) mapping. Here we approximate prob with prior
         for (p,m,reg,res) in results:
             text = self._extract(res) if not isinstance(res, Exception) else f"[ERROR: {res}]"
             responses[f"{reg}:{p}/{m}"] = {"text": text, "provider": p, "model": m}
         return responses
 
+    # simple verification / agreement among experts
     async def verify_claims(self, query, final_text, expert_responses) -> Dict[str,Any]:
-        """
-        Pluggable verifier: If WEB_SEARCH key provided, do web verification.
-        This stub returns simple cross-check signals: agreement score across experts.
-        """
-        # compute simple agreement: pairwise similarity (very cheap heuristic: token overlap ratio)
         def overlap(a,b):
             sa = set(a.lower().split())
             sb = set(b.lower().split())
@@ -131,8 +151,8 @@ class SuperBrain:
         agreement = total/pairs if pairs>0 else 0.0
         return {"agreement": agreement}
 
+    # aggregate expert responses
     async def aggregate(self, query, expert_responses):
-        # build weighted prompt by provider prior + simple quality heuristics
         parts = []
         for k,v in expert_responses.items():
             prov = v["provider"]
@@ -149,36 +169,36 @@ Task: produce ONE high-quality, concise answer. Provide:
 3) If experts disagree, state contradictions and confidence.
 """
         messages = [{"role":"system","content":"You are an expert meta-aggregator."},{"role":"user","content":prompt}]
-        # try summarizer candidates by priority
         for prov, model in MODELS["summarizer"]:
             try:
                 resp = await self.client.chat(prov, model, messages, max_tokens=900, temperature=0.2)
                 return self._extract(resp)
             except Exception:
                 continue
-        # fallback: concatenate
+        # fallback
         return "\n\n".join([f"{k}\n{v['text']}" for k,v in expert_responses.items()])
 
+    # main ask method
     async def ask(self, query):
-        # 1) recall relevant memory
+        # 1) recall memory
         recalls = self.mem.search(query, k=3)
         context = "\n".join([f"Recall: {t}" for t,meta,d in recalls]) if recalls else ""
         prompt_query = (context + "\n\n" + query).strip()
 
-        # 2) decide regions
+        # 2) classify regions
         regions = await self.classify_regions(query)
         logger.info("Regions: %s", regions)
 
-        # 3) call experts in parallel (adaptive sampling)
+        # 3) call experts (async)
         expert_responses = await self.run_region_experts(regions, prompt_query)
 
         # 4) aggregate/summarize
         final = await self.aggregate(query, expert_responses)
 
-        # 5) verify / compute agreement
+        # 5) verify agreement
         verify = await self.verify_claims(query, final, expert_responses)
 
-        # 6) store to memory (async)
+        # 6) store to memory
         try:
             self.mem.add([f"Q: {query}\nA: {final}"], [{"time": time.time()}])
         except Exception:
